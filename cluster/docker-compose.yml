@@ -1,0 +1,159 @@
+# PostgreSQL 17 - 3-node high-availability cluster.
+#   etcd1..3   distributed consensus store (leader election, cluster state)
+#   pg1..3     PostgreSQL 17 managed by Patroni: 1 primary + 2 replicas,
+#              automatic failover, synchronous replication (1 sync standby),
+#              WAL archiving + backups with pgBackRest (shared repo volume)
+#   haproxy    single entry point: 5432 read-write (primary), 5433 read-only
+# Start: ./up.sh   (creates ../.env with random passwords on first run)
+#
+# All containers run on one docker host here (lab / staging). In production
+# put etcdN + pgN on three separate servers (same files, one service per host)
+# and the pgBackRest repository on a fourth location (S3 / backup server).
+name: pg-cluster
+
+x-etcd: &etcd
+  image: quay.io/coreos/etcd:v3.5.17
+  restart: unless-stopped
+  environment: &etcd-env
+    ETCD_LISTEN_PEER_URLS: http://0.0.0.0:2380
+    ETCD_LISTEN_CLIENT_URLS: http://0.0.0.0:2379
+    ETCD_INITIAL_CLUSTER: etcd1=http://etcd1:2380,etcd2=http://etcd2:2380,etcd3=http://etcd3:2380
+    ETCD_INITIAL_CLUSTER_STATE: new
+    ETCD_INITIAL_CLUSTER_TOKEN: pg-cluster-etcd
+    ETCD_DATA_DIR: /etcd-data
+    ETCD_AUTO_COMPACTION_RETENTION: "1"
+    ETCD_QUOTA_BACKEND_BYTES: "2147483648"
+  healthcheck:
+    test: ["CMD", "etcdctl", "endpoint", "health"]
+    interval: 10s
+    timeout: 5s
+    retries: 5
+  deploy:
+    resources:
+      limits: {cpus: "1", memory: 512m}
+  logging: &logging
+    driver: json-file
+    options: {max-size: "50m", max-file: "5"}
+
+x-pg: &pg
+  build: ./patroni
+  image: pgha/patroni:17
+  restart: unless-stopped
+  env_file: ../.env
+  depends_on:
+    etcd1: {condition: service_healthy}
+    etcd2: {condition: service_healthy}
+    etcd3: {condition: service_healthy}
+  shm_size: 1g
+  stop_grace_period: 2m
+  ulimits:
+    nofile: {soft: 65536, hard: 65536}
+  deploy:
+    resources:
+      limits: {cpus: "4", memory: 4g}
+      reservations: {memory: 1g}
+  healthcheck:
+    # healthy = Patroni API answers and PostgreSQL is running (primary or replica)
+    test: ["CMD-SHELL", "curl -fsS http://localhost:8008/health >/dev/null"]
+    interval: 10s
+    timeout: 5s
+    retries: 6
+    start_period: 120s
+  logging: *logging
+
+services:
+  etcd1:
+    <<: *etcd
+    container_name: etcd1
+    hostname: etcd1
+    environment:
+      <<: *etcd-env
+      ETCD_NAME: etcd1
+      ETCD_INITIAL_ADVERTISE_PEER_URLS: http://etcd1:2380
+      ETCD_ADVERTISE_CLIENT_URLS: http://etcd1:2379
+    volumes: [etcd1-data:/etcd-data]
+  etcd2:
+    <<: *etcd
+    container_name: etcd2
+    hostname: etcd2
+    environment:
+      <<: *etcd-env
+      ETCD_NAME: etcd2
+      ETCD_INITIAL_ADVERTISE_PEER_URLS: http://etcd2:2380
+      ETCD_ADVERTISE_CLIENT_URLS: http://etcd2:2379
+    volumes: [etcd2-data:/etcd-data]
+  etcd3:
+    <<: *etcd
+    container_name: etcd3
+    hostname: etcd3
+    environment:
+      <<: *etcd-env
+      ETCD_NAME: etcd3
+      ETCD_INITIAL_ADVERTISE_PEER_URLS: http://etcd3:2380
+      ETCD_ADVERTISE_CLIENT_URLS: http://etcd3:2379
+    volumes: [etcd3-data:/etcd-data]
+
+  pg1:
+    <<: *pg
+    container_name: pg1
+    hostname: pg1
+    environment:
+      PATRONI_NAME: pg1
+      # DR: ../dr.sh cluster restore-cluster sets these for pg1 only
+      PATRONI_BOOTSTRAP: ${PG1_BOOTSTRAP:-initdb}
+      RESTORE_TARGET_TIME: ${RESTORE_TARGET_TIME:-}
+    volumes:
+      - pg1-data:/var/lib/postgresql/data
+      - pgbackrest-repo:/var/lib/pgbackrest
+      - ./pgbackrest/pgbackrest.conf:/etc/pgbackrest/pgbackrest.conf:ro
+  pg2:
+    <<: *pg
+    container_name: pg2
+    hostname: pg2
+    environment:
+      PATRONI_NAME: pg2
+    volumes:
+      - pg2-data:/var/lib/postgresql/data
+      - pgbackrest-repo:/var/lib/pgbackrest
+      - ./pgbackrest/pgbackrest.conf:/etc/pgbackrest/pgbackrest.conf:ro
+  pg3:
+    <<: *pg
+    container_name: pg3
+    hostname: pg3
+    environment:
+      PATRONI_NAME: pg3
+    volumes:
+      - pg3-data:/var/lib/postgresql/data
+      - pgbackrest-repo:/var/lib/pgbackrest
+      - ./pgbackrest/pgbackrest.conf:/etc/pgbackrest/pgbackrest.conf:ro
+
+  haproxy:
+    image: haproxy:3.0-alpine
+    container_name: pg-haproxy
+    hostname: pg-haproxy
+    restart: unless-stopped
+    depends_on: [pg1, pg2, pg3]
+    ports:
+      - "${BIND_ADDRESS:-127.0.0.1}:6432:5432"   # read-write (primary)
+      - "${BIND_ADDRESS:-127.0.0.1}:6433:5433"   # read-only (replicas)
+      - "${BIND_ADDRESS:-127.0.0.1}:7000:7000"   # HAProxy stats
+    volumes:
+      - ./haproxy/haproxy.cfg:/usr/local/etc/haproxy/haproxy.cfg:ro
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1:7000/"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+    deploy:
+      resources:
+        limits: {cpus: "1", memory: 256m}
+    logging: *logging
+
+volumes:
+  etcd1-data:
+  etcd2-data:
+  etcd3-data:
+  pg1-data:
+  pg2-data:
+  pg3-data:
+  pgbackrest-repo:

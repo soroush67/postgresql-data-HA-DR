@@ -1,0 +1,113 @@
+# Patroni configuration template - rendered at container start by
+# entrypoint.sh (placeholders are filled from the environment).
+scope: pg-cluster
+namespace: /service/
+name: ${PATRONI_NAME}
+
+restapi:
+  listen: 0.0.0.0:8008
+  connect_address: ${PATRONI_NAME}:8008
+
+etcd3:
+  hosts: etcd1:2379,etcd2:2379,etcd3:2379
+
+log:
+  level: INFO
+
+bootstrap:
+  # Settings stored in etcd and shared by all members (change later with
+  # `patronictl edit-config`, not here).
+  dcs:
+    ttl: 30
+    loop_wait: 10
+    retry_timeout: 10
+    maximum_lag_on_failover: 1048576       # 1 MB: a lagging replica is not promoted
+    synchronous_mode: true                 # one synchronous standby -> no data loss on failover
+    synchronous_mode_strict: false         # keep accepting writes if no standby is left
+    postgresql:
+      use_pg_rewind: true
+      use_slots: true
+      parameters:
+        max_connections: 200
+        shared_buffers: 1GB
+        effective_cache_size: 3GB
+        work_mem: 32MB
+        maintenance_work_mem: 512MB
+        wal_level: replica
+        wal_log_hints: "on"
+        wal_compression: lz4
+        wal_buffers: 64MB
+        max_wal_size: 8GB
+        min_wal_size: 1GB
+        wal_keep_size: 2GB
+        checkpoint_timeout: 15min
+        checkpoint_completion_target: 0.9
+        max_wal_senders: 10
+        max_replication_slots: 10
+        hot_standby: "on"
+        hot_standby_feedback: "on"
+        archive_mode: "on"
+        archive_command: pgbackrest --stanza=main archive-push %p
+        archive_timeout: 60s
+        random_page_cost: 1.1
+        effective_io_concurrency: 200
+        max_worker_processes: 8
+        max_parallel_workers: 8
+        max_parallel_workers_per_gather: 4
+        max_parallel_maintenance_workers: 4
+        autovacuum_max_workers: 4
+        autovacuum_vacuum_scale_factor: 0.05
+        autovacuum_analyze_scale_factor: 0.02
+        password_encryption: scram-sha-256
+        shared_preload_libraries: pg_stat_statements
+        track_io_timing: "on"
+        log_min_duration_statement: 1000
+        log_checkpoints: "on"
+        log_lock_waits: "on"
+        log_line_prefix: '%m [%p] %q%u@%d '
+        timezone: UTC
+
+  # How a brand-new cluster is created:
+  #   initdb    - empty cluster (default)
+  #   pgbackrest- restore from the pgBackRest repository (DR, see ../dr.sh)
+  method: ${PATRONI_BOOTSTRAP}
+  initdb:
+    - data-checksums
+    - encoding: UTF8
+    - locale-provider: builtin
+    - builtin-locale: C.UTF-8
+  pgbackrest:
+    command: /usr/local/bin/pgbackrest-bootstrap.sh
+    keep_existing_recovery_conf: true
+    no_params: true
+  post_bootstrap: /usr/local/bin/post-bootstrap.sh
+
+postgresql:
+  listen: 0.0.0.0:5432
+  connect_address: ${PATRONI_NAME}:5432
+  data_dir: /var/lib/postgresql/data/pgdata
+  bin_dir: /usr/lib/postgresql/17/bin
+  pgpass: /tmp/pgpass
+  authentication:
+    superuser:
+      username: postgres
+      password: ${POSTGRES_SUPERUSER_PASSWORD}
+    replication:
+      username: replicator
+      password: ${POSTGRES_REPLICATION_PASSWORD}
+  parameters:
+    unix_socket_directories: /var/run/postgresql
+  pg_hba:
+    - local   all          postgres                 peer
+    - local   all          all                      scram-sha-256
+    - host    replication  replicator  0.0.0.0/0    scram-sha-256
+    - host    all          all         0.0.0.0/0    scram-sha-256
+
+watchdog:
+  mode: off          # no /dev/watchdog inside containers
+
+tags:
+  nofailover: false
+  noloadbalance: false
+  clonefrom: false
+  nosync: false

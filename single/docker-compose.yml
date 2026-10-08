@@ -1,0 +1,53 @@
+# PostgreSQL 17 - single node, production setup.
+#   - tuned postgresql.conf, scram-sha-256, data checksums
+#   - WAL archiving + backups with pgBackRest (separate volume)
+#   - healthcheck, resource limits, log rotation, graceful shutdown
+# Start: ./up.sh   (creates ../.env with random passwords on first run)
+name: pg-single
+
+services:
+  postgres:
+    build: ../image
+    image: pgha/postgres:17
+    container_name: pg-single
+    hostname: pg-single
+    restart: unless-stopped
+    env_file: ../.env
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: ${POSTGRES_SUPERUSER_PASSWORD:?run up.sh or create ../.env}
+      POSTGRES_DB: postgres
+      PGDATA: /var/lib/postgresql/data/pgdata
+      POSTGRES_INITDB_ARGS: "--data-checksums --encoding=UTF8 --locale-provider=builtin --builtin-locale=C.UTF-8"
+    command: ["postgres", "-c", "config_file=/etc/postgresql/postgresql.conf"]
+    ports:
+      - "${BIND_ADDRESS:-127.0.0.1}:5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      - pgbackrest-repo:/var/lib/pgbackrest
+      - ./conf/postgresql.conf:/etc/postgresql/postgresql.conf:ro
+      - ./conf/pg_hba.conf:/etc/postgresql/pg_hba.conf:ro
+      - ./conf/pgbackrest.conf:/etc/pgbackrest/pgbackrest.conf:ro
+      - ./conf/initdb.sh:/docker-entrypoint-initdb.d/10-init.sh:ro
+    shm_size: 1g
+    stop_grace_period: 2m
+    stop_signal: SIGINT          # "fast" shutdown: no waiting for clients
+    ulimits:
+      nofile: {soft: 65536, hard: 65536}
+    deploy:
+      resources:
+        limits: {cpus: "4", memory: 8g}
+        reservations: {memory: 2g}
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d postgres -h 127.0.0.1"]
+      interval: 10s
+      timeout: 5s
+      retries: 6
+      start_period: 60s
+    logging:
+      driver: json-file
+      options: {max-size: "50m", max-file: "5"}
+
+volumes:
+  pgdata:
+  pgbackrest-repo:
