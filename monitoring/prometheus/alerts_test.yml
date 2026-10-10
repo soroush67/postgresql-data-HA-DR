@@ -1,0 +1,88 @@
+# Unit tests for alerts.yml:
+#   docker run --rm --entrypoint promtool -v "$PWD/monitoring/prometheus:/p" -w /p \
+#          prom/prometheus:v3.7.2 test rules alerts_test.yml
+rule_files: [alerts.yml]
+evaluation_interval: 1m
+
+tests:
+  - name: database down fires after 1m, not before
+    interval: 1m
+    input_series:
+      - series: 'pg_up{instance="pg-single",job="postgres"}'
+        values: '1 1 0 0 0'
+    alert_rule_test:
+      - {eval_time: 2m, alertname: PostgresDown, exp_alerts: []}
+      - eval_time: 4m
+        alertname: PostgresDown
+        exp_alerts:
+          - exp_labels: {severity: critical, instance: pg-single, job: postgres}
+            exp_annotations: {summary: "PostgreSQL pg-single is not reachable by the exporter"}
+
+  - name: WAL archiving keeps failing
+    interval: 1m
+    input_series:
+      - series: 'pg_stat_archiver_failed_count{instance="pg-single",job="postgres"}'
+        values: '0 0 1 2 3 4 5 6 7 8 9 10 11 12'
+    alert_rule_test:
+      - eval_time: 12m
+        alertname: WalArchivingFailing
+        exp_alerts:
+          - exp_labels: {severity: critical, instance: pg-single, job: postgres}
+            exp_annotations: {summary: "archive_command keeps failing - WAL piles up in pg_wal and PITR has a gap"}
+
+  - name: pg_wal growing past 1.5 x max_wal_size
+    interval: 1m
+    input_series:
+      - series: 'pg_wal_size_bytes{instance="pg-single",job="postgres"}'
+        values: '13000000000x15'
+      - series: 'pg_settings_max_wal_size_bytes{instance="pg-single",job="postgres"}'
+        values: '8589934592x15'
+    alert_rule_test:
+      - eval_time: 12m
+        alertname: WalDirectoryLarge
+        exp_alerts:
+          - exp_labels: {severity: critical, instance: pg-single}
+            exp_annotations: {summary: "pg_wal is 12.11GiB - WAL is not being recycled"}
+
+  - name: backups too old (any backup > 6h, full > 8d); a fresh one does not fire
+    interval: 1m
+    input_series:
+      - series: 'pgbackrest_backup_since_last_completion_seconds{backup_type="incr",stanza="main",instance="pg-single",job="pgbackrest"}'
+        values: '25200'          # 7h
+      - series: 'pgbackrest_backup_since_last_completion_seconds{backup_type="full",stanza="main",instance="pg-single",job="pgbackrest"}'
+        values: '3600'           # 1h
+    alert_rule_test:
+      - eval_time: 0m
+        alertname: BackupTooOld
+        exp_alerts:
+          - exp_labels: {severity: warning, backup_type: incr, stanza: main, instance: pg-single, job: pgbackrest}
+            exp_annotations: {summary: "last pgBackRest backup finished 7h 0m 0s ago (cron: a backup every 4 hours)"}
+      - {eval_time: 0m, alertname: FullBackupTooOld, exp_alerts: []}
+
+  - name: connections above 80% of max_connections
+    interval: 1m
+    input_series:
+      - series: 'pg_stat_activity_count{instance="pg-single",job="postgres",datname="appdb",state="active"}'
+        values: '100x10'
+      - series: 'pg_stat_activity_count{instance="pg-single",job="postgres",datname="appdb",state="idle"}'
+        values: '70x10'
+      - series: 'pg_settings_max_connections{instance="pg-single",job="postgres"}'
+        values: '200x10'
+    alert_rule_test:
+      - eval_time: 6m
+        alertname: PostgresConnectionsHigh
+        exp_alerts:
+          - exp_labels: {severity: warning, instance: pg-single}
+            exp_annotations: {summary: "85% of max_connections in use"}
+
+  - name: idle-in-transaction session open for 15 minutes
+    interval: 1m
+    input_series:
+      - series: 'pg_stat_activity_max_tx_duration{instance="pg-single",job="postgres",datname="appdb",state="idle in transaction"}'
+        values: '900x5'
+    alert_rule_test:
+      - eval_time: 2m
+        alertname: PostgresLongTransaction
+        exp_alerts:
+          - exp_labels: {severity: warning, instance: pg-single, datname: appdb}
+            exp_annotations: {summary: "transaction open for 15m 0s in appdb (blocks VACUUM, bloats tables)"}

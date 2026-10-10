@@ -1,0 +1,24 @@
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+  external_labels:
+    env: pg-single
+
+rule_files:
+  - /etc/prometheus/alerts.yml
+
+scrape_configs:
+  - job_name: postgres
+    static_configs:
+      - targets: ["pg-exporter:9187"]
+        labels: {instance: pg-single}
+
+  - job_name: pgbackrest
+    scrape_interval: 60s          # exporter collects once a minute anyway
+    static_configs:
+      - targets: ["pg-backrest-exporter:9854"]
+        labels: {instance: pg-single}
+
+  - job_name: prometheus
+    static_configs:
+      - targets: ["localhost:9090"]

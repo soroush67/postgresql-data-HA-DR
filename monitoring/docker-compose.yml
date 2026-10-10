@@ -1,0 +1,92 @@
+# Monitoring for the single node: postgres_exporter + pgbackrest_exporter +
+# Prometheus (with alert rules) + Grafana (provisioned dashboard).
+# Start: ./up.sh   (needs the single node running: ../single/up.sh)
+#
+# Joins the single node's network (pg-single_default) and mounts its backup
+# repository volume READ-ONLY for pgbackrest_exporter.
+name: pg-monitoring
+
+services:
+  postgres-exporter:
+    image: quay.io/prometheuscommunity/postgres-exporter:v0.18.1
+    container_name: pg-exporter
+    restart: unless-stopped
+    environment:
+      DATA_SOURCE_URI: "pg-single:5432/${APP_DB}?sslmode=disable"
+      DATA_SOURCE_USER: monitor
+      DATA_SOURCE_PASS: ${MONITOR_PASSWORD:?run up.sh}
+    command:
+      - --collector.stat_statements
+      - --collector.stat_statements.include_query   # query text label (first 120 chars)
+      - --collector.stat_checkpointer
+      - --collector.postmaster
+    networks: [pg]
+    logging: &logging
+      driver: json-file
+      options: {max-size: "10m", max-file: "3"}
+
+  pgbackrest-exporter:
+    build: ./pgbackrest-exporter
+    image: pgha/pgbackrest-exporter:0.21.0
+    container_name: pg-backrest-exporter
+    restart: unless-stopped
+    environment:
+      PGBACKREST_LOG_LEVEL_FILE: "off"    # read-only repo: no log files
+    command:
+      - --backrest.config=/etc/pgbackrest/pgbackrest.conf
+      - --collect.interval=60
+    volumes:
+      - pgbackrest-repo:/var/lib/pgbackrest:ro
+      - ../single/conf/pgbackrest.conf:/etc/pgbackrest/pgbackrest.conf:ro
+    networks: [pg]
+    logging: *logging
+
+  prometheus:
+    image: prom/prometheus:v3.7.2
+    container_name: pg-prometheus
+    restart: unless-stopped
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.path=/prometheus
+      - --storage.tsdb.retention.time=15d
+      - --storage.tsdb.retention.size=2GB      # disk is tight on this host
+      - --web.enable-lifecycle
+    ports:
+      - "${BIND_ADDRESS:-127.0.0.1}:9090:9090"
+    volumes:
+      - ./prometheus:/etc/prometheus:ro
+      - prometheus-data:/prometheus
+    networks: [pg]
+    logging: *logging
+
+  grafana:
+    image: grafana/grafana:12.2.0
+    container_name: pg-grafana
+    restart: unless-stopped
+    environment:
+      GF_SECURITY_ADMIN_USER: admin
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_ADMIN_PASSWORD:?run up.sh}
+      GF_USERS_ALLOW_SIGN_UP: "false"
+      GF_ANALYTICS_REPORTING_ENABLED: "false"
+      GF_ANALYTICS_CHECK_FOR_UPDATES: "false"
+      GF_DASHBOARDS_DEFAULT_HOME_DASHBOARD_PATH: /var/lib/grafana/dashboards/postgresql.json
+    ports:
+      - "${BIND_ADDRESS:-127.0.0.1}:3000:3000"
+    volumes:
+      - ./grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./grafana/dashboards:/var/lib/grafana/dashboards:ro
+      - grafana-data:/var/lib/grafana
+    networks: [pg]
+    logging: *logging
+
+networks:
+  pg:
+    name: pg-single_default
+    external: true
+
+volumes:
+  pgbackrest-repo:
+    name: pg-single_pgbackrest-repo
+    external: true
+  prometheus-data:
+  grafana-data:

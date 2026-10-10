@@ -1,0 +1,107 @@
+# Alert rules for the single node. Visible at http://127.0.0.1:9090/alerts
+# (no Alertmanager here - add one and an `alerting:` block in prometheus.yml
+# to send them to mail/Slack/Telegram).
+groups:
+  - name: postgresql
+    rules:
+      - alert: PostgresDown
+        expr: pg_up == 0
+        for: 1m
+        labels: {severity: critical}
+        annotations:
+          summary: "PostgreSQL {{ $labels.instance }} is not reachable by the exporter"
+
+      - alert: PostgresExporterDown
+        expr: up{job=~"postgres|pgbackrest"} == 0
+        for: 2m
+        labels: {severity: critical}
+        annotations:
+          summary: "exporter {{ $labels.job }} is down - no metrics, no alerts"
+
+      - alert: PostgresRestarted
+        expr: time() - pg_postmaster_start_time_seconds < 300
+        labels: {severity: info}
+        annotations:
+          summary: "PostgreSQL restarted {{ $value | humanizeDuration }} ago"
+
+      - alert: PostgresConnectionsHigh
+        expr: sum by (instance) (pg_stat_activity_count) / on (instance) max by (instance) (pg_settings_max_connections) > 0.8
+        for: 5m
+        labels: {severity: warning}
+        annotations:
+          summary: "{{ $value | humanizePercentage }} of max_connections in use"
+
+      - alert: PostgresLongTransaction
+        expr: max by (instance, datname) (pg_stat_activity_max_tx_duration{state=~"active|idle in transaction.*"}) > 600
+        for: 1m
+        labels: {severity: warning}
+        annotations:
+          summary: "transaction open for {{ $value | humanizeDuration }} in {{ $labels.datname }} (blocks VACUUM, bloats tables)"
+
+      - alert: PostgresDeadlocks
+        expr: increase(pg_stat_database_deadlocks[5m]) > 0
+        labels: {severity: warning}
+        annotations:
+          summary: "{{ $value | humanize }} deadlock(s) in {{ $labels.datname }} in the last 5 minutes"
+
+      - alert: PostgresCacheHitRatioLow
+        expr: |
+          sum by (instance, datname) (rate(pg_stat_database_blks_hit{datname!~"template.*"}[10m]))
+            / (sum by (instance, datname) (rate(pg_stat_database_blks_hit{datname!~"template.*"}[10m]))
+             + sum by (instance, datname) (rate(pg_stat_database_blks_read{datname!~"template.*"}[10m]))) < 0.90
+          and sum by (instance, datname) (rate(pg_stat_database_blks_read[10m])) > 100
+        for: 15m
+        labels: {severity: warning}
+        annotations:
+          summary: "buffer cache hit ratio {{ $value | humanizePercentage }} in {{ $labels.datname }} (shared_buffers too small?)"
+
+      - alert: PostgresCollectorFailing
+        expr: pg_scrape_collector_success == 0
+        for: 10m
+        labels: {severity: warning}
+        annotations:
+          summary: "postgres_exporter collector {{ $labels.collector }} keeps failing"
+
+  - name: wal-and-backup
+    rules:
+      - alert: WalArchivingFailing
+        expr: increase(pg_stat_archiver_failed_count[10m]) > 0
+        for: 5m
+        labels: {severity: critical}
+        annotations:
+          summary: "archive_command keeps failing - WAL piles up in pg_wal and PITR has a gap"
+
+      - alert: WalDirectoryLarge
+        # max_wal_size is 8 GB; well above it means WAL is not being recycled
+        # (archiving stuck or a replication slot holding it) -> disk fills up
+        expr: pg_wal_size_bytes > on (instance) (1.5 * pg_settings_max_wal_size_bytes)
+        for: 10m
+        labels: {severity: critical}
+        annotations:
+          summary: "pg_wal is {{ $value | humanize1024 }}B - WAL is not being recycled"
+
+      - alert: BackupTooOld
+        # incr = newest backup of any type (a full/diff also counts)
+        expr: pgbackrest_backup_since_last_completion_seconds{backup_type="incr"} > 6 * 3600
+        labels: {severity: warning}
+        annotations:
+          summary: "last pgBackRest backup finished {{ $value | humanizeDuration }} ago (cron: a backup every 4 hours)"
+
+      - alert: FullBackupTooOld
+        expr: pgbackrest_backup_since_last_completion_seconds{backup_type="full"} > 8 * 86400
+        labels: {severity: warning}
+        annotations:
+          summary: "last FULL backup is {{ $value | humanizeDuration }} old (cron is weekly)"
+
+      - alert: BackupFailed
+        expr: pgbackrest_backup_last_error_status > 0
+        labels: {severity: critical}
+        annotations:
+          summary: "last {{ $labels.backup_type }} backup has errors (checksum/read errors in files)"
+
+      - alert: BackupRepoUnhealthy
+        expr: pgbackrest_stanza_status > 0 or pgbackrest_repo_status > 0 or pgbackrest_exporter_status == 0
+        for: 5m
+        labels: {severity: critical}
+        annotations:
+          summary: "pgBackRest stanza/repository is not OK - check ./dr.sh single check"

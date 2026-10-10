@@ -9,6 +9,7 @@
    - `single/docker-compose.yml`: یک نود PostgreSQL 17
    - `cluster/docker-compose.yml`: کلاستر سه‌نودی با **Patroni + etcd + HAProxy** و failover خودکار
 3. **`dr.sh`**: بکاپ و بازیابی با **pgBackRest**، شامل بازیابی تا یک لحظه‌ی مشخص (PITR)، تمرین DR، بازسازی کامل کلاستر و تست failover.
+4. **`monitoring/`**: پایش نود single با **postgres_exporter + pgbackrest_exporter + Prometheus + Grafana**، به همراه ۱۴ قانون هشدار (بخش ۵-۱).
 
 همه‌ی سناریوهای این سند واقعاً روی همین فایل‌ها اجرا و تأیید شده‌اند. نتیجه‌ها در [بخش ۹](#results) آمده است.
 
@@ -29,12 +30,18 @@ postgresql-data-HA-DR/
 │   ├── docker-compose.yml     # single node
 │   ├── up.sh / down.sh
 │   └── conf/                  # postgresql.conf, pg_hba.conf, pgbackrest.conf, initdb.sh
-└── cluster/
-    ├── docker-compose.yml     # etcd x3 + Patroni/PostgreSQL x3 + HAProxy
+├── cluster/
+│   ├── docker-compose.yml     # etcd x3 + Patroni/PostgreSQL x3 + HAProxy
+│   ├── up.sh / down.sh
+│   ├── patroni/               # Dockerfile, patroni.yml.tmpl, entrypoint, bootstrap scripts
+│   ├── haproxy/haproxy.cfg
+│   └── pgbackrest/pgbackrest.conf
+└── monitoring/                # for the single node
+    ├── docker-compose.yml     # postgres_exporter, pgbackrest_exporter, Prometheus, Grafana
     ├── up.sh / down.sh
-    ├── patroni/               # Dockerfile, patroni.yml.tmpl, entrypoint, bootstrap scripts
-    ├── haproxy/haproxy.cfg
-    └── pgbackrest/pgbackrest.conf
+    ├── pgbackrest-exporter/   # Dockerfile: exporter binary on top of pgha/postgres:17
+    ├── prometheus/            # prometheus.yml, alerts.yml, alerts_test.yml (promtool)
+    └── grafana/               # provisioned datasource + dashboards/postgresql.json
 ```
 
 </div>
@@ -213,6 +220,64 @@ docker logs -f pg-single
 </div>
 
 > **مهم برای DR:** در single، فایل `postgresql.conf` از `single/conf` mount می‌شود و **داخل بکاپ نیست.** هنگام بازیابی (`dr.sh`) همین فایل استفاده می‌شود. اگر روی سرور دیگری بازیابی می‌کنید، پوشه‌ی `single/conf` را هم داشته باشید. بدون آن، PostgreSQL با پیش‌فرض‌های initdb بالا می‌آید و recovery را متوقف می‌کند، چون مثلاً `max_connections=100` کمتر از مقدار سرور اصلی (۲۰۰) است. این دقیقاً در تست ما رخ داد و اسکریپت برای همین اصلاح شده است.
+
+### ۵-۱. مانیتورینگ (`monitoring/`)
+
+<div dir="ltr">
+
+```
+pg-single ──► postgres_exporter (:9187) ──┐
+                                          ├──► Prometheus (:9090, alerts.yml) ──► Grafana (:3000)
+backup repo ─► pgbackrest_exporter (:9854)┘
+ (volume, read-only)
+```
+
+</div>
+
+| جزء | نقش |
+|---|---|
+| `postgres_exporter` v0.18.1 | با نقش فقط‌خواندنی `monitor` (عضو `pg_monitor`) وصل می‌شود. وضعیت سرور، اتصال‌ها، TPS، cache hit، قفل‌ها، WAL، آرشیو، checkpointها و **pg_stat_statements** (همراه متن کوئری) را می‌دهد |
+| `pgbackrest_exporter` v0.21.0 | `pgbackrest info` را هر ۶۰ ثانیه روی مخزن بکاپ اجرا می‌کند: سن آخرین بکاپ، حجم، مدت و خطا. مخزن **read-only** mount می‌شود |
+| Prometheus v3.7.2 | نگهداری ۱۵ روز و **حداکثر ۲ گیگ** (به خاطر محدودیت دیسک) |
+| Grafana 12.2 | datasource و داشبورد «PostgreSQL single node» (۳۰ پنل) خودکار provision می‌شوند و داشبورد صفحه‌ی اصلی است |
+
+<div dir="ltr">
+
+```bash
+./monitoring/up.sh              # needs ./single/up.sh first; creates the monitor role (idempotent)
+# Grafana    http://127.0.0.1:3000   admin / GRAFANA_ADMIN_PASSWORD from .env
+# Prometheus http://127.0.0.1:9090/alerts
+./monitoring/down.sh            # stop (keeps metrics)
+./monitoring/down.sh --wipe     # also delete Prometheus/Grafana data (never the DB or backups)
+
+# unit tests for the alert rules
+docker run --rm --entrypoint promtool -v "$PWD/monitoring/prometheus:/p" -w /p \
+       prom/prometheus:v3.7.2 test rules alerts_test.yml
+```
+
+</div>
+
+`up.sh` دو رمز `MONITOR_PASSWORD` و `GRAFANA_ADMIN_PASSWORD` را به صورت تصادفی به `.env` اضافه می‌کند.
+
+**بخش‌های داشبورد:** نمای کلی (UP، uptime، حجم، درصد اتصال، cache hit، سن آخرین بکاپ و آخرین full، خطای آرشیو)، بار کاری (تراکنش و ردیف در ثانیه، اتصال‌ها به تفکیک state، طولانی‌ترین تراکنش، قفل‌ها، deadlock و فایل temp)، ذخیره‌سازی (حجم دیتابیس، حجم `pg_wal` در برابر `max_wal_size`، checkpointهای timed و requested، نرخ آرشیو)، بکاپ‌ها، و ۱۰ کوئری سنگین و ۱۰ کوئری پرتکرار.
+
+**هشدارها** (`monitoring/prometheus/alerts.yml`):
+
+| هشدار | شرط |
+|---|---|
+| `PostgresDown` / `PostgresExporterDown` | دیتابیس یا یکی از exporterها بیشتر از ۱ تا ۲ دقیقه در دسترس نیست |
+| `PostgresRestarted` | سرور در ۵ دقیقه‌ی اخیر ری‌استارت شده است |
+| `PostgresConnectionsHigh` | بیش از ۸۰٪ از `max_connections` به مدت ۵ دقیقه پر است |
+| `PostgresLongTransaction` | تراکنش active یا idle in transaction بیش از ۱۰ دقیقه باز مانده است |
+| `PostgresDeadlocks` / `PostgresCacheHitRatioLow` | deadlock رخ داده، یا cache hit زیر ۹۰٪ است (فقط وقتی خواندن از دیسک واقعاً زیاد است) |
+| `WalArchivingFailing` | `archive_command` مدام خطا می‌دهد، پس PITR ناقص می‌شود |
+| `WalDirectoryLarge` | حجم `pg_wal` از ۱.۵ برابر `max_wal_size` بیشتر شده. یعنی WAL بازیافت نمی‌شود و دیسک پر خواهد شد |
+| `BackupTooOld` / `FullBackupTooOld` | آخرین بکاپ قدیمی‌تر از ۶ ساعت، یا آخرین full قدیمی‌تر از ۸ روز است (مطابق `dr.sh single cron`) |
+| `BackupFailed` / `BackupRepoUnhealthy` | آخرین بکاپ خطا دارد، یا stanza یا مخزن سالم نیست |
+
+> در این پروژه Alertmanager نیست و هشدارها در `http://127.0.0.1:9090/alerts` دیده می‌شوند. برای ارسال به ایمیل، Slack یا Telegram، یک Alertmanager و بلوک `alerting:` را به `prometheus.yml` اضافه کنید. مانیتورینگ فعلاً فقط برای single است.
+
+> چرا image رسمی `woblerr/pgbackrest_exporter` مستقیم استفاده نشده؟ entrypoint آن وقتی با root اجرا شود، روی `/var/lib/pgbackrest` دستور `chown -R` اجرا می‌کند و مالکیت مخزن بکاپ را عوض می‌کند. pgBackRest داخل آن هم نسخه‌ی 2.56 است، در حالی که مخزن ما با 2.59.3 نوشته شده. برای همین فقط باینری exporter روی image خودمان (`pgha/postgres:17`) کپی می‌شود و با کاربر postgres اجرا می‌شود.
 
 ---
 
@@ -477,7 +542,27 @@ repo1-cipher-pass=<long-random-passphrase>
 
 برای ۱۵ گیگ کامل روی کلاستر حدود ۱۰۰ گیگ فضای آزاد واقعی لازم است.
 
-### ۹-۴. مشکل‌هایی که در تست پیدا و اصلاح شد
+### ۹-۴. single با ۵ گیگ داده و مانیتورینگ (2026-10-10)
+
+برای کم کردن مصرف دیسک، single با `down.sh --wipe` پاک و با ۵ گیگ داده از نو ساخته شد: `./script.sh generate --rows 3333300 --size-gb 5`.
+
+| مورد | نتیجه |
+|---|---|
+| ساخت داده | **۳٬۳۳۳٬۳۰۰ ردیف** (هر جدول ۳۳٬۳۳۳)، ۱۰۰ جدول × ۳۰ ستون، **۵.۱ GB** و ۱۶۱۰ بایت برای هر ردیف. زمان کل **۲۰۱ ثانیه** (بارگذاری ۱۶۴ ثانیه). `verify` موفق بود |
+| بکاپ full | **۱۴ ثانیه**، از ۵.۱ گیگ داده به ۲.۱ گیگ در مخزن |
+| حجم volumeهای داکر | از **۴۰ گیگ به ۱۸ گیگ** رسید: `pgdata` ۱۲.۵ گیگ (۵ گیگ داده به همراه WAL تا سقف `max_wal_size=8GB`) و مخزن بکاپ ۵.۷ گیگ |
+| بار کاری pgbench (۳ دقیقه، ۸ کلاینت، خواندن با PK، اسکن بازه‌ای و UPDATE) | **۴۳۴۰ TPS**، تأخیر میانگین ۱.۸ ms، بدون خطا |
+| کوئری‌های داشبورد | هر ۳۸ کوئری داشبورد روی Prometheus داده برگرداندند. کوئری از مسیر Grafana و health datasource هم OK بود |
+| تست واحد هشدارها (`promtool test rules`) | ۶ سناریو موفق: DB down، خطای آرشیو، رشد `pg_wal`، بکاپ قدیمی (و قدیمی نبودن full)، اتصال بالای ۸۰٪، و تراکنش idle in transaction |
+| تست واقعی (`docker stop pg-single`) | `PostgresDown` بعد از **۹۰ ثانیه** firing شد. بعد از start، این هشدار رفع شد و `PostgresRestarted` firing شد. `dr.sh single check` هم OK بود |
+
+> فایل vhdx در WSL خودبه‌خود کوچک نمی‌شود. پس فضای آزاد درایو C: بعد از پاک کردن عوض نمی‌شود، ولی آن ۲۲ گیگ داخل vhdx دوباره قابل استفاده است. برای پس گرفتن واقعی فضا، `Optimize-VHD` را در بخش ۲ ببینید.
+
+دو مشکل هم در این مرحله پیدا شد:
+- collector `long_running_transactions` در postgres_exporter 0.18.1 وقتی تراکنش بازی نیست، هر بار با خطای `converting NULL to float64` شکست می‌خورد. این collector حذف شد و هشدار تراکنش طولانی حالا از `pg_stat_activity_max_tx_duration` استفاده می‌کند.
+- در 0.18 متن کوئری روی متریک جداگانه‌ی `pg_stat_statements_query_id` است، نه روی خود متریک‌های زمان و تعداد. پنل‌ها با `* on (queryid) group_left (query)` آن را join می‌کنند.
+
+### ۹-۵. مشکل‌هایی که در تست پیدا و اصلاح شد
 
 1. **بازیابی single بدون فایل conf:** فایل `postgresql.conf` بیرون از PGDATA بود و در بکاپ نیامد. نسخه‌ی بازیابی‌شده با `max_connections=100` بالا آمد و PostgreSQL recovery را متوقف کرد. حالا `dr.sh` همان فایل conf را استفاده می‌کند (بخش ۵).
 2. **session آویزان در HAProxy بعد از crash:** resolver داکر نام نود از کار افتاده را حذف می‌کرد. در نتیجه HAProxy سرور را به حالت `MAINT` می‌برد، نه `DOWN`، و sessionهای آن نود بسته نمی‌شد. با `hold nx/obsolete` اصلاح شد.
@@ -497,15 +582,18 @@ repo1-cipher-pass=<long-random-passphrase>
 | HAProxy اتصال را رد می‌کند | صفحه‌ی `http://127.0.0.1:7000` را ببینید: کدام نود UP است؟ |
 | یک replica عقب مانده یا خراب است | `docker exec pg1 patronictl -c /tmp/patroni.yml reinit pg-cluster pg3` |
 | حجم WAL زیاد شده | `./dr.sh <mode> check`. اگر آرشیو کار نکند، WAL پاک نمی‌شود |
+| Grafana داده نشان نمی‌دهد | `http://127.0.0.1:9090/targets`: آیا هر سه target در حالت UP هستند؟ اگر `postgres` در حالت DOWN است، `./monitoring/up.sh` را دوباره اجرا کنید تا نقش `monitor` و رمز آن هماهنگ شود |
+| پنل‌های بکاپ خالی هستند | تا اولین بکاپ داده‌ای نیست: `./dr.sh single backup full`. exporter هر ۶۰ ثانیه به‌روز می‌شود |
 
 ## ۱۱. پاک کردن همه‌چیز
 
 <div dir="ltr">
 
 ```bash
+./monitoring/down.sh --wipe
 ./single/down.sh --wipe
 ./cluster/down.sh --wipe
-docker image rm pgha/patroni:17 pgha/postgres:17
+docker image rm pgha/pgbackrest-exporter:0.21.0 pgha/patroni:17 pgha/postgres:17
 rm .env
 ```
 
